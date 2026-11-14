@@ -1,0 +1,58 @@
+name: Sync upstream
+
+# Once a day, brings agentes-chat/agentes-chat's main to this repository as a pull request: the branch
+# sync/upstream is moved forward to upstream's main, and a pull request from it into main is opened if none is
+# open. Nothing merges by itself; conflicts are resolved in the pull request (a fix committed there stops the
+# branch from moving until it is merged). Nothing is ever pushed upstream.
+#
+# SYNC_TOKEN (Settings → Secrets and variables → Actions): a fine-grained token for this repository with
+# Contents, Pull requests and Workflows set to read and write. The default GITHUB_TOKEN can't push commits that
+# change .github/workflows, which upstream's often do, and a pull request it opens starts no CI.
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: sync-upstream
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Open or refresh the sync pull request
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          REPO: ${{ github.repository }}
+          UPSTREAM: https://github.com/agentes-chat/agentes-chat.git
+          BRANCH: sync/upstream
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ]; then echo "::error::The SYNC_TOKEN secret is not set"; exit 1; fi
+
+          git init -q --bare sync.git && cd sync.git
+          git fetch -q "$UPSTREAM" main
+          upstream=$(git rev-parse FETCH_HEAD)
+
+          # "identical" or "ahead": main already holds upstream's main. A commit this repository lacks is a 404.
+          status=$(gh api "repos/$REPO/compare/$upstream...main" --jq .status 2>/dev/null || echo missing)
+          if [ "$status" = identical ] || [ "$status" = ahead ]; then
+            echo "main already has upstream's ${upstream:0:9}"
+            exit 0
+          fi
+
+          # No force: once someone commits a conflict fix on the branch, the push is refused and the fix is kept.
+          if ! git push -q "https://x-access-token:$GH_TOKEN@github.com/$REPO.git" "$upstream:refs/heads/$BRANCH"; then
+            echo "::warning::$BRANCH has commits of its own, so it was left as it is; merge or close its pull request"
+            exit 0
+          fi
+
+          if [ "$(gh pr list -R "$REPO" --head "$BRANCH" --state open --json number --jq length)" = 0 ]; then
+            gh pr create -R "$REPO" --base main --head "$BRANCH" \
+              --title "chore: sync upstream main" \
+              --body "Brings agentes-chat/agentes-chat's main into this repository's main. Opened by the Sync upstream workflow, which moves this branch to upstream's latest main every day. Merge it with a merge commit (not squash), so the next sync starts from upstream's history."
+          fi
+          echo "sync/upstream is at upstream's ${upstream:0:9}"
